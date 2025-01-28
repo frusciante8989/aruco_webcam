@@ -4,14 +4,14 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-evasdk = "*"
 opencv-python = "*"
 opencv-contrib-python = "*"
 numpy = "*"
 imutils = "*"
 apriltag = "*"
+matplotlib = "*"
 
 [dev-packages]
 
 [requires]
-python_version = "3.6"
+python_version = "3"
