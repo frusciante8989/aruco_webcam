@@ -1,14 +1,57 @@
-# Andrea Antonello 2024
 import argparse
 import logging
 import cv2
 import numpy as np
-from datetime import datetime
 import json
-from config.config_manager import load_json_config, overwrite_json_config
+import threading
+from flask import Flask, render_template, Response
+import paho.mqtt.client as mqtt
+from datetime import datetime
+from config.config_manager import load_json_config
 from src.calibration import Calibration
-import matplotlib.pyplot as plt
-import matplotlib as mpl
+import time
+import json
+
+# MQTT Configuration
+MQTT_BROKER = "localhost"
+MQTT_PORT = 1883
+MQTT_TOPIC = "camera/aruco"
+
+# Flask Configuration
+app = Flask(__name__)
+
+# MQTT client setup
+client = mqtt.Client()
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+client.loop_start()
+
+# Global variable for the camera feed
+cap = None
+marker_size = 0.05  # Marker size in meters (adjust as per your setup)
+
+
+
+# Variables for MQTT and streaming
+last_mqtt_publish_time = 0
+annotated_frame = None
+
+
+def generate_feed():
+    """Generates the video stream for Flask."""
+    global annotated_frame
+    while True:
+        if annotated_frame is not None:
+            _, buffer = cv2.imencode(".jpg", annotated_frame)
+            frame_data = buffer.tobytes()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_data + b"\r\n")
+
+
+@app.route("/video_feed")
+def video_feed():
+    """Route for video stream."""
+    return Response(generate_feed(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
 
 def return_camera_indexes():
     index = 0
@@ -23,41 +66,28 @@ def return_camera_indexes():
         i -= 1
     return arr
 
-def setup_calibration():
-    print('Entering camera calibration')
-
-def setup_source():
-    print('Entering camera selection')
-    sources = return_camera_indexes()
-    if len(sources) != 0:
-        if len(sources) == 1:
-            logging.warning('Only one camera available at source 0. This input will be used.')
-            return overwrite_json_config(key="source", value=int(0))
-        else:
-            input('\n----------------------------------------------------------------------------------------'
-                  '\n-----------------------------  SOURCE  SELECTION  UTILITY  -----------------------------'
-                  '\n----------------------------------------------------------------------------------------\n'
-                  'Press enter to visualise the available camera sources. '
-                  'Please note down the source number you desire. '
-                  'Press ESC to exit the imshow() \n')
-            for source in sources:
-                cap = cv2.VideoCapture(source)
-                ret, frame = cap.read()
-                cv2.putText(frame, str(source), (int(frame.shape[1]/2), int(frame.shape[0]/2)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 10, (0, 0, 0), 20)
-                cv2.imshow('Source ' + str(source), frame)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            cv2.waitKey(1)
-            input_source = input(f'Please enter the camera source you desire to use. Available sources are {sources}\n')
-            if int(input_source) in sources:
-                return overwrite_json_config(key="source", value=int(input_source))
-            else:
-                raise ValueError('Selected input source is not available')
-    else:
-        raise ValueError('No input sources detected')
+def my_estimatePoseSingleMarkers(corners, marker_size, mtx, distortion):
+    marker_points = np.array([[-marker_size / 2, marker_size / 2, 0],
+                              [marker_size / 2, marker_size / 2, 0],
+                              [marker_size / 2, -marker_size / 2, 0],
+                              [-marker_size / 2, -marker_size / 2, 0]], dtype=np.float32)
+    trash = []
+    rvecs = []
+    tvecs = []
+    
+    for c in corners:
+        nada, R, t = cv2.solvePnP(marker_points, c, mtx, distortion, False, cv2.SOLVEPNP_IPPE_SQUARE)
+        rvecs.append(R)
+        tvecs.append(t)
+        trash.append(nada)
+    return rvecs, tvecs, trash
 
 def detect_aruco_and_estimate_pose():
+    global annotated_frame
+    start_time = time.time()
+    
+    
+    global cap
     source = int(load_json_config()['source'])
     cap = cv2.VideoCapture(source)
 
@@ -67,9 +97,10 @@ def detect_aruco_and_estimate_pose():
     dist_coeffs = np.array(config['dist'])
 
     # Define ArUco dictionary and detector parameters
-    aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_type)
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
     aruco_params = cv2.aruco.DetectorParameters()
-
+    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -80,24 +111,43 @@ def detect_aruco_and_estimate_pose():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Detect ArUco markers
-        corners, ids, rejected = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+        corners, ids, rejected = detector.detectMarkers(frame)
 
+        marker_info = {}
+        len_ids = 0
+        distance = 0
+        
         if ids is not None:
+            len_ids = len(ids)
             # Draw detected markers
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            # Estimate pose for each marker
-            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, 0.05, camera_matrix, dist_coeffs)
-            for rvec, tvec in zip(rvecs, tvecs):
+            # Print the number of markers detected
+            marker_info["num_markers"] = len(ids)
+            marker_info["marker_ids"] = ids.flatten().tolist()
+
+            rvecs, tvecs, trash = my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, dist_coeffs)
+
+            for rvec, tvec, marker_id in zip(rvecs, tvecs, ids.flatten()):
+                # Calculate distance to the camera
+                distance = np.linalg.norm(tvec)
+
                 # Draw axis for the marker
-                # cv2.aruco.drawAxis(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.1)
                 thickness = 5
                 cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.03, thickness)
+        
+        # Update the annotated frame for streaming
+        annotated_frame = frame.copy()
+                
+        # Create a JSON payload
+        payload = json.dumps({
+            "num_markers": len_ids,
+            "distance": round(distance, 2)
+        })
 
-                # Display translation and rotation vectors
-                text = f"Tvec: {tvec.flatten()} Rvec: {rvec.flatten()}"
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                print(f"Marker detected at Tvec: {tvec.flatten()} Rvec: {rvec.flatten()}")
+        # Publish the payload to the MQTT topic
+        client.publish(MQTT_TOPIC, payload)
+        print(f"Published: {payload}")
 
         # Display the frame
         cv2.imshow('Aruco Marker Detection', frame)
@@ -108,47 +158,12 @@ def detect_aruco_and_estimate_pose():
 
     cap.release()
     cv2.destroyAllWindows()
+    client.disconnect()
 
-def generate_aruco_markers_pdf():
-    print('Generating sample ArUco markers PDF')
-    aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_type)
-
-    fig = plt.figure()
-    nx = 4
-    ny = 3
-    for i in range(1, nx * ny + 1):
-        ax = fig.add_subplot(ny, nx, i)
-        img = cv2.aruco.generateImageMarker(aruco_dict, i, 700)
-        plt.imshow(img, cmap=mpl.cm.gray, interpolation="nearest")
-        ax.axis('off')
-
-    pdf_filename = "aruco_markers.pdf"
-    plt.savefig(pdf_filename, format="pdf", bbox_inches="tight")
-    plt.close()
-    print(f"Sample ArUco markers saved to {pdf_filename}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Aruco Tags Examples',
                                      formatter_class=argparse.RawTextHelpFormatter)
-
-    parser.add_argument(
-        '--calibrate',
-        action='store_true', default=False, help='Performs the intrinsic camera calibration'
-    )
-
-    parser.add_argument(
-        '--source', '-r',
-        action='store_true', default=False, help='Selects camera source'
-    )
-
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true', help='Increases the output verbosity')
-
-    parser.add_argument(
-        '--generate_markers', '-g',
-        action='store_true', default=False, help='Generate a PDF of sample ArUco markers'
-    )
 
     parser.add_argument(
         '--aruco', '-a',
@@ -157,30 +172,19 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == '__main__':
-    aruco_type = cv2.aruco.DICT_6X6_250
-
-    while int(load_json_config()['source']) == -1:
-        setup_source()
-
     ns = parse_args()
 
-    if ns.calibrate:
-        while int(load_json_config()['source']) == -1:
-            setup_source()
-        cal = Calibration(load_json_config())
-        cal.calibrate_from_images()
+    if ns.aruco:
+        # Start a background thread for ArUco marker detection and MQTT publishing
+        threading.Thread(target=detect_aruco_and_estimate_pose, daemon=True).start()
 
-    elif ns.source:
-        setup_source()
-        while int(load_json_config()['source']) == -1:
-            setup_source()
+    import threading
 
-    elif ns.aruco:
-        detect_aruco_and_estimate_pose()
+    # Run detection loop in a separate thread
+    detection_thread = threading.Thread(target=detect_aruco_and_estimate_pose)
+    detection_thread.daemon = True
+    detection_thread.start()
 
-    elif ns.generate_markers:
-        generate_aruco_markers_pdf()
+    # Start Flask app
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
-    else:
-        logging.error('Please specify program mode.')
-        raise SystemExit
